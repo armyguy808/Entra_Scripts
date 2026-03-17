@@ -1,0 +1,640 @@
+<#
+.SYNOPSIS
+    Export a report of all Microsoft Entra ID privileged admin role users.
+
+.DESCRIPTION
+    This script finds users who have access to privileged Entra admin roles through:
+      1. Direct active role assignment
+      2. Direct PIM active role assignment
+      3. Direct PIM eligible role assignment
+      4. Group-based role assignment (current group members)
+      5. PIM for Groups active membership in role-assigned groups
+      6. PIM for Groups eligible membership in role-assigned groups
+
+    IMPORTANT:
+      - The script uses Microsoft.Graph.Beta ONLY to discover which role definitions are marked IsPrivileged = true.
+      - The report is user-focused. Service principals are intentionally excluded.
+      - Group role assignments are resolved to users through transitive membership.
+
+.REQUIREMENTS
+    Modules:
+      Microsoft.Graph.Authentication
+      Microsoft.Graph.Users
+      Microsoft.Graph.Groups
+      Microsoft.Graph.Identity.DirectoryManagement
+      Microsoft.Graph.Identity.Governance
+      Microsoft.Graph.Beta.Identity.Governance
+
+    Recommended delegated scopes:
+      RoleManagement.Read.Directory
+      Directory.Read.All
+      Group.Read.All
+      GroupMember.Read.All
+      User.Read.All
+      PrivilegedAssignmentSchedule.Read.AzureADGroup
+      PrivilegedEligibilitySchedule.Read.AzureADGroup
+
+.EXAMPLE
+    .\Get-EntraPrivilegedRoleUsers.ps1
+
+.EXAMPLE
+    .\Get-EntraPrivilegedRoleUsers.ps1 -OutputPath C:\Temp\EntraPrivilegedRoleUsers.csv
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".\EntraPrivilegedRoleUsers.csv"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+#------------------------------------------------------------
+# Helper: Ensure required modules
+#------------------------------------------------------------
+$requiredModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Groups',
+    'Microsoft.Graph.Identity.DirectoryManagement',
+    'Microsoft.Graph.Identity.Governance',
+    'Microsoft.Graph.Beta.Identity.Governance'
+)
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        throw "Required module '$module' is not installed. Install it with: Install-Module $module"
+    }
+}
+
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.Users
+Import-Module Microsoft.Graph.Groups
+Import-Module Microsoft.Graph.Identity.DirectoryManagement
+Import-Module Microsoft.Graph.Identity.Governance
+Import-Module Microsoft.Graph.Beta.Identity.Governance
+
+#------------------------------------------------------------
+# Connect to Microsoft Graph
+#------------------------------------------------------------
+$scopes = @(
+    'RoleManagement.Read.Directory',
+    'Directory.Read.All',
+    'Group.Read.All',
+    'GroupMember.Read.All',
+    'User.Read.All',
+    'PrivilegedAssignmentSchedule.Read.AzureADGroup',
+    'PrivilegedEligibilitySchedule.Read.AzureADGroup'
+)
+
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Connect-MgGraph -Scopes $scopes -NoWelcome | Out-Null
+
+#------------------------------------------------------------
+# Caches
+#------------------------------------------------------------
+$userCache  = @{}
+$groupCache = @{}
+
+function Get-CachedUser {
+    param(
+        [Parameter(Mandatory)]
+        [string]$UserId
+    )
+
+    if (-not $userCache.ContainsKey($UserId)) {
+        try {
+            $u = Get-MgUser -UserId $UserId -Property Id,DisplayName,UserPrincipalName,AccountEnabled -ErrorAction Stop
+            $userCache[$UserId] = [pscustomobject]@{
+                Id                = $u.Id
+                DisplayName       = $u.DisplayName
+                UserPrincipalName = $u.UserPrincipalName
+                AccountEnabled    = $u.AccountEnabled
+            }
+        }
+        catch {
+            $userCache[$UserId] = $null
+        }
+    }
+
+    return $userCache[$UserId]
+}
+
+function Get-CachedGroup {
+    param(
+        [Parameter(Mandatory)]
+        [string]$GroupId
+    )
+
+    if (-not $groupCache.ContainsKey($GroupId)) {
+        try {
+            $g = Get-MgGroup -GroupId $GroupId -Property Id,DisplayName,MailNickname,IsAssignableToRole -ErrorAction Stop
+            $groupCache[$GroupId] = [pscustomobject]@{
+                Id                 = $g.Id
+                DisplayName        = $g.DisplayName
+                MailNickname       = $g.MailNickname
+                IsAssignableToRole = $g.IsAssignableToRole
+            }
+        }
+        catch {
+            $groupCache[$GroupId] = $null
+        }
+    }
+
+    return $groupCache[$GroupId]
+}
+
+function Convert-ScopeIdToText {
+    param(
+        [AllowNull()]
+        [string]$ScopeId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ScopeId) -or $ScopeId -eq '/') {
+        return 'Tenant'
+    }
+
+    return $ScopeId
+}
+
+function New-ReportRow {
+    param(
+        [Parameter(Mandatory)]
+        [string]$UserId,
+
+        [Parameter(Mandatory)]
+        [string]$RoleDefinitionId,
+
+        [Parameter(Mandatory)]
+        [string]$RoleName,
+
+        [Parameter(Mandatory)]
+        [string]$AccessType,
+
+        [Parameter(Mandatory)]
+        [string]$AssignmentState,
+
+        [Parameter(Mandatory)]
+        [string]$AssignmentPath,
+
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter()]
+        [string]$DirectoryScopeId,
+
+        [Parameter()]
+        [string]$DirectoryScopeText,
+
+        [Parameter()]
+        [string]$AssignmentType,
+
+        [Parameter()]
+        [string]$GroupId,
+
+        [Parameter()]
+        [string]$GroupName,
+
+        [Parameter()]
+        [string]$MembershipState,
+
+        [Parameter()]
+        [string]$MemberType,
+
+        [Parameter()]
+        [AllowNull()]
+        [datetime]$StartDateTime,
+
+        [Parameter()]
+        [AllowNull()]
+        [datetime]$EndDateTime
+    )
+
+    $user = Get-CachedUser -UserId $UserId
+    if (-not $user) {
+        return $null
+    }
+
+    [pscustomobject]@{
+        UserDisplayName       = $user.DisplayName
+        UserPrincipalName     = $user.UserPrincipalName
+        UserId                = $user.Id
+        AccountEnabled        = $user.AccountEnabled
+
+        RoleName              = $RoleName
+        RoleDefinitionId      = $RoleDefinitionId
+
+        AssignmentState       = $AssignmentState   # Active / Eligible
+        AccessType            = $AccessType        # Direct / Group / Group-PIM
+        AssignmentPath        = $AssignmentPath    # Explains the path to privilege
+        Source                = $Source            # Which API/cmdlet family produced the record
+        AssignmentType        = $AssignmentType    # Assigned / Activated / Unknown
+
+        GroupName             = $GroupName
+        GroupId               = $GroupId
+        GroupMembershipState  = $MembershipState   # Active / Eligible / Blank
+        GroupMemberType       = $MemberType        # Member / Owner / Blank
+
+        DirectoryScopeId      = $DirectoryScopeId
+        DirectoryScope        = $DirectoryScopeText
+
+        StartDateTime         = $StartDateTime
+        EndDateTime           = $EndDateTime
+    }
+}
+
+#------------------------------------------------------------
+# Get privileged role definitions (Beta required for IsPrivileged)
+#------------------------------------------------------------
+Write-Host "Reading privileged role definitions..." -ForegroundColor Cyan
+$privilegedRoleDefinitions = Get-MgBetaRoleManagementDirectoryRoleDefinition `
+    -All `
+    -Filter "isPrivileged eq true" `
+    -Property Id,DisplayName,IsPrivileged,IsBuiltIn,IsEnabled
+
+if (-not $privilegedRoleDefinitions) {
+    throw "No privileged role definitions were returned."
+}
+
+$privilegedRoleMap = @{}
+foreach ($roleDef in $privilegedRoleDefinitions) {
+    $privilegedRoleMap[$roleDef.Id] = $roleDef
+}
+
+$privilegedRoleDefinitionIds = @($privilegedRoleMap.Keys)
+
+Write-Host ("Found {0} privileged role definitions." -f $privilegedRoleDefinitionIds.Count) -ForegroundColor Green
+
+#------------------------------------------------------------
+# Report storage
+#------------------------------------------------------------
+$report = New-Object System.Collections.Generic.List[object]
+
+#------------------------------------------------------------
+# 1) Direct active assignments from activated directory roles
+#    This catches currently active members in activated roles.
+#------------------------------------------------------------
+Write-Host "Reading direct active members from activated directory roles..." -ForegroundColor Cyan
+$activatedDirectoryRoles = Get-MgDirectoryRole -All
+
+foreach ($dirRole in $activatedDirectoryRoles) {
+    if (-not $privilegedRoleMap.ContainsKey($dirRole.RoleTemplateId)) {
+        continue
+    }
+
+    $roleName = $dirRole.DisplayName
+    $roleDefinitionId = $dirRole.RoleTemplateId
+
+    $members = Get-MgDirectoryRoleMember -DirectoryRoleId $dirRole.Id -All
+
+    foreach ($member in $members) {
+        $odataType = $member.AdditionalProperties.'@odata.type'
+
+        switch ($odataType) {
+            '#microsoft.graph.user' {
+                $row = New-ReportRow `
+                    -UserId $member.Id `
+                    -RoleDefinitionId $roleDefinitionId `
+                    -RoleName $roleName `
+                    -AccessType 'Direct' `
+                    -AssignmentState 'Active' `
+                    -AssignmentPath 'Direct active role membership' `
+                    -Source 'DirectoryRoleMember' `
+                    -DirectoryScopeId '/' `
+                    -DirectoryScopeText 'Tenant' `
+                    -AssignmentType 'Assigned'
+                if ($row) { $report.Add($row) }
+            }
+
+            '#microsoft.graph.group' {
+                $group = Get-CachedGroup -GroupId $member.Id
+                if (-not $group) { continue }
+
+                $groupUsers = Get-MgGroupTransitiveMemberAsUser -GroupId $group.Id -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled
+
+                foreach ($groupUser in $groupUsers) {
+                    $row = New-ReportRow `
+                        -UserId $groupUser.Id `
+                        -RoleDefinitionId $roleDefinitionId `
+                        -RoleName $roleName `
+                        -AccessType 'Group' `
+                        -AssignmentState 'Active' `
+                        -AssignmentPath 'Role assigned to group; current transitive group member' `
+                        -Source 'DirectoryRoleMember + GroupTransitiveMemberAsUser' `
+                        -DirectoryScopeId '/' `
+                        -DirectoryScopeText 'Tenant' `
+                        -AssignmentType 'Assigned' `
+                        -GroupId $group.Id `
+                        -GroupName $group.DisplayName `
+                        -MembershipState 'Active'
+                    if ($row) { $report.Add($row) }
+                }
+            }
+        }
+    }
+}
+
+#------------------------------------------------------------
+# 2) PIM active role assignments
+#------------------------------------------------------------
+Write-Host "Reading PIM active role assignment schedule instances..." -ForegroundColor Cyan
+$activeRoleSchedules = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All
+
+#------------------------------------------------------------
+# 3) PIM eligible role assignments
+#------------------------------------------------------------
+Write-Host "Reading PIM eligible role assignment schedule instances..." -ForegroundColor Cyan
+$eligibleRoleSchedules = Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -All
+
+# Collect groups that have privileged roles so we can resolve PIM-for-Groups
+$roleAssignedGroups = @{}
+
+foreach ($item in $activeRoleSchedules) {
+    if (-not $privilegedRoleMap.ContainsKey($item.RoleDefinitionId)) {
+        continue
+    }
+
+    $roleName = $privilegedRoleMap[$item.RoleDefinitionId].DisplayName
+    $scopeText = Convert-ScopeIdToText -ScopeId $item.DirectoryScopeId
+    $assignmentType = if ($item.AssignmentType) { $item.AssignmentType } else { 'Unknown' }
+
+    if ($item.PrincipalId) {
+        # Determine principal type from AdditionalProperties if present
+        $principalType = $null
+        if ($item.AdditionalProperties.ContainsKey('principalType')) {
+            $principalType = [string]$item.AdditionalProperties['principalType']
+        }
+
+        if ($principalType -eq 'User') {
+            $row = New-ReportRow `
+                -UserId $item.PrincipalId `
+                -RoleDefinitionId $item.RoleDefinitionId `
+                -RoleName $roleName `
+                -AccessType 'Direct' `
+                -AssignmentState 'Active' `
+                -AssignmentPath 'Direct PIM active role assignment' `
+                -Source 'RoleAssignmentScheduleInstance' `
+                -DirectoryScopeId $item.DirectoryScopeId `
+                -DirectoryScopeText $scopeText `
+                -AssignmentType $assignmentType `
+                -StartDateTime $item.StartDateTime `
+                -EndDateTime $item.EndDateTime
+            if ($row) { $report.Add($row) }
+        }
+        elseif ($principalType -eq 'Group') {
+            $group = Get-CachedGroup -GroupId $item.PrincipalId
+            if (-not $group) { continue }
+
+            if (-not $roleAssignedGroups.ContainsKey($group.Id)) {
+                $roleAssignedGroups[$group.Id] = New-Object System.Collections.Generic.List[object]
+            }
+
+            $roleAssignedGroups[$group.Id].Add([pscustomobject]@{
+                RoleDefinitionId = $item.RoleDefinitionId
+                RoleName         = $roleName
+                AssignmentState  = 'Active'
+                DirectoryScopeId = $item.DirectoryScopeId
+                DirectoryScope   = $scopeText
+                AssignmentType   = $assignmentType
+                StartDateTime    = $item.StartDateTime
+                EndDateTime      = $item.EndDateTime
+                Source           = 'RoleAssignmentScheduleInstance'
+            })
+
+            $groupUsers = Get-MgGroupTransitiveMemberAsUser -GroupId $group.Id -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled
+            foreach ($groupUser in $groupUsers) {
+                $row = New-ReportRow `
+                    -UserId $groupUser.Id `
+                    -RoleDefinitionId $item.RoleDefinitionId `
+                    -RoleName $roleName `
+                    -AccessType 'Group' `
+                    -AssignmentState 'Active' `
+                    -AssignmentPath 'PIM active role assigned to group; current transitive group member' `
+                    -Source 'RoleAssignmentScheduleInstance + GroupTransitiveMemberAsUser' `
+                    -DirectoryScopeId $item.DirectoryScopeId `
+                    -DirectoryScopeText $scopeText `
+                    -AssignmentType $assignmentType `
+                    -GroupId $group.Id `
+                    -GroupName $group.DisplayName `
+                    -MembershipState 'Active' `
+                    -StartDateTime $item.StartDateTime `
+                    -EndDateTime $item.EndDateTime
+                if ($row) { $report.Add($row) }
+            }
+        }
+    }
+}
+
+foreach ($item in $eligibleRoleSchedules) {
+    if (-not $privilegedRoleMap.ContainsKey($item.RoleDefinitionId)) {
+        continue
+    }
+
+    $roleName = $privilegedRoleMap[$item.RoleDefinitionId].DisplayName
+    $scopeText = Convert-ScopeIdToText -ScopeId $item.DirectoryScopeId
+    $assignmentType = if ($item.AssignmentType) { $item.AssignmentType } else { 'Unknown' }
+
+    if ($item.PrincipalId) {
+        $principalType = $null
+        if ($item.AdditionalProperties.ContainsKey('principalType')) {
+            $principalType = [string]$item.AdditionalProperties['principalType']
+        }
+
+        if ($principalType -eq 'User') {
+            $row = New-ReportRow `
+                -UserId $item.PrincipalId `
+                -RoleDefinitionId $item.RoleDefinitionId `
+                -RoleName $roleName `
+                -AccessType 'Direct' `
+                -AssignmentState 'Eligible' `
+                -AssignmentPath 'Direct PIM eligible role assignment' `
+                -Source 'RoleEligibilityScheduleInstance' `
+                -DirectoryScopeId $item.DirectoryScopeId `
+                -DirectoryScopeText $scopeText `
+                -AssignmentType $assignmentType `
+                -StartDateTime $item.StartDateTime `
+                -EndDateTime $item.EndDateTime
+            if ($row) { $report.Add($row) }
+        }
+        elseif ($principalType -eq 'Group') {
+            $group = Get-CachedGroup -GroupId $item.PrincipalId
+            if (-not $group) { continue }
+
+            if (-not $roleAssignedGroups.ContainsKey($group.Id)) {
+                $roleAssignedGroups[$group.Id] = New-Object System.Collections.Generic.List[object]
+            }
+
+            $roleAssignedGroups[$group.Id].Add([pscustomobject]@{
+                RoleDefinitionId = $item.RoleDefinitionId
+                RoleName         = $roleName
+                AssignmentState  = 'Eligible'
+                DirectoryScopeId = $item.DirectoryScopeId
+                DirectoryScope   = $scopeText
+                AssignmentType   = $assignmentType
+                StartDateTime    = $item.StartDateTime
+                EndDateTime      = $item.EndDateTime
+                Source           = 'RoleEligibilityScheduleInstance'
+            })
+
+            # Optional: include current group members for eligible group role assignment
+            # This tells you who could receive the role if/when the group role eligibility is activated.
+            $groupUsers = Get-MgGroupTransitiveMemberAsUser -GroupId $group.Id -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled
+            foreach ($groupUser in $groupUsers) {
+                $row = New-ReportRow `
+                    -UserId $groupUser.Id `
+                    -RoleDefinitionId $item.RoleDefinitionId `
+                    -RoleName $roleName `
+                    -AccessType 'Group' `
+                    -AssignmentState 'Eligible' `
+                    -AssignmentPath 'PIM eligible role assigned to group; current transitive group member' `
+                    -Source 'RoleEligibilityScheduleInstance + GroupTransitiveMemberAsUser' `
+                    -DirectoryScopeId $item.DirectoryScopeId `
+                    -DirectoryScopeText $scopeText `
+                    -AssignmentType $assignmentType `
+                    -GroupId $group.Id `
+                    -GroupName $group.DisplayName `
+                    -MembershipState 'Active' `
+                    -StartDateTime $item.StartDateTime `
+                    -EndDateTime $item.EndDateTime
+                if ($row) { $report.Add($row) }
+            }
+        }
+    }
+}
+
+#------------------------------------------------------------
+# 4) PIM for Groups for role-assigned groups
+#------------------------------------------------------------
+Write-Host "Reading PIM for Groups assignment and eligibility schedule instances..." -ForegroundColor Cyan
+
+foreach ($groupId in $roleAssignedGroups.Keys) {
+    $group = Get-CachedGroup -GroupId $groupId
+    if (-not $group) { continue }
+
+    $groupRoleEntries = $roleAssignedGroups[$groupId]
+
+    # Active PIM-for-Groups members/owners
+    try {
+        $groupActivePim = Get-MgIdentityGovernancePrivilegedAccessGroupAssignmentScheduleInstance `
+            -Filter "groupId eq '$groupId'" `
+            -All
+    }
+    catch {
+        Write-Warning "Unable to read active PIM-for-Groups schedule instances for group '$($group.DisplayName)' ($groupId): $_"
+        $groupActivePim = @()
+    }
+
+    foreach ($groupPimItem in $groupActivePim) {
+        $principalId = $groupPimItem.PrincipalId
+        if (-not $principalId) { continue }
+
+        foreach ($roleEntry in $groupRoleEntries) {
+            $row = New-ReportRow `
+                -UserId $principalId `
+                -RoleDefinitionId $roleEntry.RoleDefinitionId `
+                -RoleName $roleEntry.RoleName `
+                -AccessType 'Group-PIM' `
+                -AssignmentState $roleEntry.AssignmentState `
+                -AssignmentPath 'Role assigned to group; user has active PIM-for-Groups membership/ownership' `
+                -Source ($roleEntry.Source + ' + PrivilegedAccessGroupAssignmentScheduleInstance') `
+                -DirectoryScopeId $roleEntry.DirectoryScopeId `
+                -DirectoryScopeText $roleEntry.DirectoryScope `
+                -AssignmentType $roleEntry.AssignmentType `
+                -GroupId $group.Id `
+                -GroupName $group.DisplayName `
+                -MembershipState 'Active' `
+                -MemberType $groupPimItem.AccessId `
+                -StartDateTime $groupPimItem.StartDateTime `
+                -EndDateTime $groupPimItem.EndDateTime
+            if ($row) { $report.Add($row) }
+        }
+    }
+
+    # Eligible PIM-for-Groups members/owners
+    try {
+        $groupEligiblePim = Get-MgIdentityGovernancePrivilegedAccessGroupEligibilityScheduleInstance `
+            -Filter "groupId eq '$groupId'" `
+            -All
+    }
+    catch {
+        Write-Warning "Unable to read eligible PIM-for-Groups schedule instances for group '$($group.DisplayName)' ($groupId): $_"
+        $groupEligiblePim = @()
+    }
+
+    foreach ($groupPimItem in $groupEligiblePim) {
+        $principalId = $groupPimItem.PrincipalId
+        if (-not $principalId) { continue }
+
+        foreach ($roleEntry in $groupRoleEntries) {
+            $row = New-ReportRow `
+                -UserId $principalId `
+                -RoleDefinitionId $roleEntry.RoleDefinitionId `
+                -RoleName $roleEntry.RoleName `
+                -AccessType 'Group-PIM' `
+                -AssignmentState $roleEntry.AssignmentState `
+                -AssignmentPath 'Role assigned to group; user has eligible PIM-for-Groups membership/ownership' `
+                -Source ($roleEntry.Source + ' + PrivilegedAccessGroupEligibilityScheduleInstance') `
+                -DirectoryScopeId $roleEntry.DirectoryScopeId `
+                -DirectoryScopeText $roleEntry.DirectoryScope `
+                -AssignmentType $roleEntry.AssignmentType `
+                -GroupId $group.Id `
+                -GroupName $group.DisplayName `
+                -MembershipState 'Eligible' `
+                -MemberType $groupPimItem.AccessId `
+                -StartDateTime $groupPimItem.StartDateTime `
+                -EndDateTime $groupPimItem.EndDateTime
+            if ($row) { $report.Add($row) }
+        }
+    }
+}
+
+#------------------------------------------------------------
+# Deduplicate
+#------------------------------------------------------------
+Write-Host "Deduplicating report rows..." -ForegroundColor Cyan
+
+$dedupedReport = $report |
+    Where-Object { $_ -ne $null } |
+    Sort-Object UserPrincipalName, RoleName, AssignmentState, AccessType, GroupName, DirectoryScope, AssignmentPath, GroupMembershipState, GroupMemberType |
+    Group-Object `
+        UserId,
+        RoleDefinitionId,
+        AssignmentState,
+        AccessType,
+        AssignmentPath,
+        GroupId,
+        GroupMembershipState,
+        GroupMemberType,
+        DirectoryScopeId |
+    ForEach-Object {
+        $_.Group | Select-Object -First 1
+    } |
+    Sort-Object RoleName, UserPrincipalName, AssignmentState, AccessType, GroupName
+
+#------------------------------------------------------------
+# Export
+#------------------------------------------------------------
+$parent = Split-Path -Path $OutputPath -Parent
+if ($parent -and -not (Test-Path -Path $parent)) {
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+}
+
+$dedupedReport | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "Done." -ForegroundColor Green
+Write-Host ("Rows exported: {0}" -f $dedupedReport.Count) -ForegroundColor Green
+Write-Host ("CSV path     : {0}" -f (Resolve-Path $OutputPath).Path) -ForegroundColor Green
+
+# Optional: display a quick summary
+$summary = $dedupedReport |
+    Group-Object RoleName, AssignmentState |
+    Sort-Object Name |
+    Select-Object @{Name='RoleName';Expression={($_.Group | Select-Object -First 1).RoleName}},
+                  @{Name='AssignmentState';Expression={($_.Group | Select-Object -First 1).AssignmentState}},
+                  Count
+
+Write-Host ""
+Write-Host "Summary:" -ForegroundColor Cyan
+$summary | Format-Table -AutoSize
