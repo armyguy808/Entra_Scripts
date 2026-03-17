@@ -1,0 +1,438 @@
+#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.Governance, Microsoft.Graph.Groups, Microsoft.Graph.Users
+
+<#
+.SYNOPSIS
+    Generates a comprehensive report of all privileged Entra ID role assignments.
+
+.DESCRIPTION
+    This script collects all privileged role assignments from three sources:
+      1. Direct Active Assignments     - Users/Groups directly assigned to a role (permanent)
+      2. PIM Eligible Assignments      - Users/Groups eligible via PIM (must activate)
+      3. PIM for Groups                - Users who are members/owners of PIM-managed groups
+                                         that are themselves assigned to a privileged role
+
+    Output is exported to a CSV file for review.
+
+.PARAMETER OutputPath
+    Path for the CSV output file. Defaults to current directory with a timestamped filename.
+
+.PARAMETER RoleFilter
+    Optional. Array of role display names to filter on. If omitted, all privileged roles are included.
+
+.EXAMPLE
+    .\Get-PrivilegedRoleReport.ps1
+
+.EXAMPLE
+    .\Get-PrivilegedRoleReport.ps1 -OutputPath "C:\Reports\PrivRoles.csv"
+
+.EXAMPLE
+    .\Get-PrivilegedRoleReport.ps1 -RoleFilter "Global Administrator","Privileged Role Administrator"
+
+.NOTES
+    Required Graph API Permissions (Application or Delegated):
+      - RoleManagement.Read.All
+      - PrivilegedAccess.Read.AzureAD
+      - Group.Read.All
+      - User.Read.All
+      - Directory.Read.All
+#>
+
+[CmdletBinding()]
+param (
+    [string]$OutputPath = ".\PrivilegedRoleReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+
+    [string[]]$RoleFilter = @()
+)
+
+# ── Privileged role list ────────────────────────────────────────────────────────
+# Based on Microsoft's list of privileged roles. Extend as needed.
+$PrivilegedRoleNames = @(
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "Exchange Administrator",
+    "SharePoint Administrator",
+    "Hybrid Identity Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator",
+    "Conditional Access Administrator",
+    "Authentication Administrator",
+    "Privileged Authentication Administrator",
+    "User Administrator",
+    "Helpdesk Administrator",
+    "Password Administrator",
+    "Groups Administrator",
+    "License Administrator",
+    "Directory Writers",
+    "Domain Name Administrator",
+    "Azure AD Joined Device Local Administrator",
+    "Intune Administrator",
+    "Teams Administrator",
+    "Billing Administrator",
+    "Compliance Administrator",
+    "Compliance Data Administrator",
+    "Security Operator",
+    "Security Reader",
+    "Global Reader",
+    "Identity Governance Administrator",
+    "Lifecycle Workflows Administrator",
+    "External Identity Provider Administrator",
+    "B2C IEF Policy Administrator",
+    "Authentication Policy Administrator",
+    "Knowledge Manager",
+    "Knowledge Administrator",
+    "Attribute Assignment Administrator",
+    "Attribute Definition Administrator",
+    "Cloud Device Administrator",
+    "Azure DevOps Administrator",
+    "Azure Information Protection Administrator",
+    "Customer LockBox Access Approver",
+    "Desktop Analytics Administrator",
+    "Microsoft Hardware Warranty Administrator",
+    "Office Apps Administrator",
+    "Power Platform Administrator",
+    "Printer Administrator",
+    "Reports Reader",
+    "Search Administrator",
+    "Service Support Administrator",
+    "Teams Communications Administrator",
+    "Teams Communications Support Engineer",
+    "Teams Communications Support Specialist",
+    "Teams Devices Administrator",
+    "Windows 365 Administrator",
+    "Yammer Administrator"
+)
+
+# If the caller passed a filter, use that instead
+if ($RoleFilter.Count -gt 0) {
+    $PrivilegedRoleNames = $RoleFilter
+}
+
+# ── Helper: resolve a principal (user / group / servicePrincipal) ───────────────
+function Resolve-Principal {
+    param (
+        [string]$PrincipalId,
+        [string]$PrincipalType   # "User", "Group", "ServicePrincipal", or empty
+    )
+
+    $result = [PSCustomObject]@{
+        DisplayName       = "Unknown"
+        UPN               = "N/A"
+        PrincipalType     = $PrincipalType
+        AccountEnabled    = "N/A"
+    }
+
+    try {
+        if ($PrincipalType -eq "User" -or $PrincipalType -eq "") {
+            $user = Get-MgUser -UserId $PrincipalId `
+                -Property "DisplayName,UserPrincipalName,AccountEnabled" `
+                -ErrorAction SilentlyContinue
+            if ($user) {
+                $result.DisplayName    = $user.DisplayName
+                $result.UPN            = $user.UserPrincipalName
+                $result.PrincipalType  = "User"
+                $result.AccountEnabled = $user.AccountEnabled
+                return $result
+            }
+        }
+
+        if ($PrincipalType -eq "Group" -or $PrincipalType -eq "") {
+            $group = Get-MgGroup -GroupId $PrincipalId `
+                -Property "DisplayName" `
+                -ErrorAction SilentlyContinue
+            if ($group) {
+                $result.DisplayName   = $group.DisplayName
+                $result.UPN           = "N/A (Group)"
+                $result.PrincipalType = "Group"
+                return $result
+            }
+        }
+
+        if ($PrincipalType -eq "ServicePrincipal" -or $PrincipalType -eq "") {
+            $sp = Get-MgServicePrincipal -ServicePrincipalId $PrincipalId `
+                -Property "DisplayName" `
+                -ErrorAction SilentlyContinue
+            if ($sp) {
+                $result.DisplayName   = $sp.DisplayName
+                $result.UPN           = "N/A (ServicePrincipal)"
+                $result.PrincipalType = "ServicePrincipal"
+                return $result
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not resolve principal $PrincipalId : $_"
+    }
+
+    return $result
+}
+
+# ── Connect to Microsoft Graph ──────────────────────────────────────────────────
+Write-Host "`n[*] Connecting to Microsoft Graph..." -ForegroundColor Cyan
+
+$requiredScopes = @(
+    "RoleManagement.Read.All",
+    "PrivilegedAccess.Read.AzureAD",
+    "Group.Read.All",
+    "User.Read.All",
+    "Directory.Read.All"
+)
+
+try {
+    Connect-MgGraph -Scopes $requiredScopes -NoWelcome -ErrorAction Stop
+    $context = Get-MgContext
+    Write-Host "[+] Connected as: $($context.Account) | Tenant: $($context.TenantId)" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to connect to Microsoft Graph: $_"
+    exit 1
+}
+
+# ── Fetch all role definitions and filter to privileged ─────────────────────────
+Write-Host "`n[*] Fetching role definitions..." -ForegroundColor Cyan
+
+$allRoleDefinitions = Get-MgRoleManagementDirectoryRoleDefinition -All
+$privilegedRoleDefs = $allRoleDefinitions | Where-Object { $_.DisplayName -in $PrivilegedRoleNames }
+
+Write-Host "[+] Found $($privilegedRoleDefs.Count) privileged role definitions to check." -ForegroundColor Green
+
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — Direct Active Assignments (permanent, non-PIM)
+# ════════════════════════════════════════════════════════════════════════════════
+Write-Host "`n[*] Collecting DIRECT ACTIVE assignments..." -ForegroundColor Cyan
+
+foreach ($roleDef in $privilegedRoleDefs) {
+    try {
+        $assignments = Get-MgRoleManagementDirectoryRoleAssignment `
+            -Filter "roleDefinitionId eq '$($roleDef.Id)'" `
+            -ExpandProperty "principal" `
+            -All `
+            -ErrorAction SilentlyContinue
+
+        foreach ($a in $assignments) {
+            $principalType = $a.Principal.AdditionalProperties.'@odata.type' -replace '#microsoft.graph.',''
+            $principal = Resolve-Principal -PrincipalId $a.PrincipalId -PrincipalType $principalType
+
+            $report.Add([PSCustomObject]@{
+                AssignmentSource     = "Direct Active"
+                RoleName             = $roleDef.DisplayName
+                RoleId               = $roleDef.Id
+                AssignmentType       = "Active"
+                PrincipalDisplayName = $principal.DisplayName
+                PrincipalUPN         = $principal.UPN
+                PrincipalType        = $principal.PrincipalType
+                PrincipalId          = $a.PrincipalId
+                AccountEnabled       = $principal.AccountEnabled
+                AssignmentScope      = if ($a.DirectoryScopeId -eq "/") { "Tenant-wide" } else { $a.DirectoryScopeId }
+                StartDateTime        = "Permanent"
+                EndDateTime          = "Permanent"
+                GroupName            = "N/A"
+                GroupId              = "N/A"
+                MembershipType       = "N/A"
+            })
+        }
+    }
+    catch {
+        Write-Warning "Error fetching direct assignments for role '$($roleDef.DisplayName)': $_"
+    }
+}
+
+Write-Host "[+] Direct active assignments collected: $(($report | Where-Object AssignmentSource -eq 'Direct Active').Count)" -ForegroundColor Green
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — PIM Eligible & Active Assignments (user/group directly to role)
+# ════════════════════════════════════════════════════════════════════════════════
+Write-Host "`n[*] Collecting PIM ELIGIBLE and PIM ACTIVE role assignments..." -ForegroundColor Cyan
+
+foreach ($roleDef in $privilegedRoleDefs) {
+    try {
+        # PIM Eligible assignments
+        $pimEligible = Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance `
+            -Filter "roleDefinitionId eq '$($roleDef.Id)'" `
+            -ExpandProperty "principal" `
+            -All `
+            -ErrorAction SilentlyContinue
+
+        foreach ($a in $pimEligible) {
+            $principalType = $a.Principal.AdditionalProperties.'@odata.type' -replace '#microsoft.graph.',''
+            $principal = Resolve-Principal -PrincipalId $a.PrincipalId -PrincipalType $principalType
+
+            $report.Add([PSCustomObject]@{
+                AssignmentSource     = "PIM Eligible"
+                RoleName             = $roleDef.DisplayName
+                RoleId               = $roleDef.Id
+                AssignmentType       = "Eligible"
+                PrincipalDisplayName = $principal.DisplayName
+                PrincipalUPN         = $principal.UPN
+                PrincipalType        = $principal.PrincipalType
+                PrincipalId          = $a.PrincipalId
+                AccountEnabled       = $principal.AccountEnabled
+                AssignmentScope      = if ($a.DirectoryScopeId -eq "/") { "Tenant-wide" } else { $a.DirectoryScopeId }
+                StartDateTime        = $a.StartDateTime
+                EndDateTime          = if ($a.EndDateTime) { $a.EndDateTime } else { "No Expiry" }
+                GroupName            = "N/A"
+                GroupId              = "N/A"
+                MembershipType       = "N/A"
+            })
+        }
+
+        # PIM Active scheduled instances (time-bound active / currently activated)
+        $pimActive = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance `
+            -Filter "roleDefinitionId eq '$($roleDef.Id)'" `
+            -ExpandProperty "principal" `
+            -All `
+            -ErrorAction SilentlyContinue
+
+        foreach ($a in $pimActive) {
+            # AssignmentType "Assigned" = permanent direct assignment already captured in Section 1
+            if ($a.AssignmentType -eq "Assigned") { continue }
+
+            $principalType = $a.Principal.AdditionalProperties.'@odata.type' -replace '#microsoft.graph.',''
+            $principal = Resolve-Principal -PrincipalId $a.PrincipalId -PrincipalType $principalType
+
+            $report.Add([PSCustomObject]@{
+                AssignmentSource     = "PIM Active (Activated)"
+                RoleName             = $roleDef.DisplayName
+                RoleId               = $roleDef.Id
+                AssignmentType       = "Active (PIM Activated)"
+                PrincipalDisplayName = $principal.DisplayName
+                PrincipalUPN         = $principal.UPN
+                PrincipalType        = $principal.PrincipalType
+                PrincipalId          = $a.PrincipalId
+                AccountEnabled       = $principal.AccountEnabled
+                AssignmentScope      = if ($a.DirectoryScopeId -eq "/") { "Tenant-wide" } else { $a.DirectoryScopeId }
+                StartDateTime        = $a.StartDateTime
+                EndDateTime          = if ($a.EndDateTime) { $a.EndDateTime } else { "No Expiry" }
+                GroupName            = "N/A"
+                GroupId              = "N/A"
+                MembershipType       = "N/A"
+            })
+        }
+    }
+    catch {
+        Write-Warning "Error fetching PIM assignments for role '$($roleDef.DisplayName)': $_"
+    }
+}
+
+$pimCount = ($report | Where-Object { $_.AssignmentSource -like "PIM*" } | Measure-Object).Count
+Write-Host "[+] PIM assignments collected: $pimCount" -ForegroundColor Green
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — PIM for Groups
+# For groups that are themselves assigned (directly or via PIM) to a role,
+# enumerate all member/owner eligible and active PIM group assignments.
+# ════════════════════════════════════════════════════════════════════════════════
+Write-Host "`n[*] Collecting PIM FOR GROUPS assignments..." -ForegroundColor Cyan
+
+# Find all groups that appear in the report so far as principals
+$roleAssignedGroupIds = $report |
+    Where-Object { $_.PrincipalType -eq "Group" } |
+    Select-Object -ExpandProperty PrincipalId -Unique
+
+Write-Host "    Found $($roleAssignedGroupIds.Count) group(s) assigned to privileged roles." -ForegroundColor Yellow
+
+foreach ($groupId in $roleAssignedGroupIds) {
+    # Get role context for this group (could span multiple roles)
+    $groupRoleEntries = $report | Where-Object { $_.PrincipalId -eq $groupId -and $_.PrincipalType -eq "Group" }
+    $groupDisplayName = ($groupRoleEntries | Select-Object -First 1).PrincipalDisplayName
+
+    Write-Host "    Processing group: $groupDisplayName ($groupId)" -ForegroundColor Yellow
+
+    try {
+        # PIM for Groups — Eligible members/owners
+        $eligibleSchedules = Get-MgIdentityGovernancePrivilegedAccessGroupEligibilityScheduleInstance `
+            -Filter "groupId eq '$groupId'" `
+            -All `
+            -ErrorAction SilentlyContinue
+
+        foreach ($schedule in $eligibleSchedules) {
+            $principal = Resolve-Principal -PrincipalId $schedule.PrincipalId -PrincipalType "User"
+
+            foreach ($roleEntry in $groupRoleEntries) {
+                $report.Add([PSCustomObject]@{
+                    AssignmentSource     = "PIM for Groups (Eligible)"
+                    RoleName             = $roleEntry.RoleName
+                    RoleId               = $roleEntry.RoleId
+                    AssignmentType       = "Eligible (via Group)"
+                    PrincipalDisplayName = $principal.DisplayName
+                    PrincipalUPN         = $principal.UPN
+                    PrincipalType        = $principal.PrincipalType
+                    PrincipalId          = $schedule.PrincipalId
+                    AccountEnabled       = $principal.AccountEnabled
+                    AssignmentScope      = $roleEntry.AssignmentScope
+                    StartDateTime        = $schedule.StartDateTime
+                    EndDateTime          = if ($schedule.EndDateTime) { $schedule.EndDateTime } else { "No Expiry" }
+                    GroupName            = $groupDisplayName
+                    GroupId              = $groupId
+                    MembershipType       = $schedule.AccessId   # "member" or "owner"
+                })
+            }
+        }
+
+        # PIM for Groups — Active (currently activated) members/owners
+        $activeSchedules = Get-MgIdentityGovernancePrivilegedAccessGroupAssignmentScheduleInstance `
+            -Filter "groupId eq '$groupId'" `
+            -All `
+            -ErrorAction SilentlyContinue
+
+        foreach ($schedule in $activeSchedules) {
+            $principal = Resolve-Principal -PrincipalId $schedule.PrincipalId -PrincipalType "User"
+
+            foreach ($roleEntry in $groupRoleEntries) {
+                $report.Add([PSCustomObject]@{
+                    AssignmentSource     = "PIM for Groups (Active)"
+                    RoleName             = $roleEntry.RoleName
+                    RoleId               = $roleEntry.RoleId
+                    AssignmentType       = "Active (via Group)"
+                    PrincipalDisplayName = $principal.DisplayName
+                    PrincipalUPN         = $principal.UPN
+                    PrincipalType        = $principal.PrincipalType
+                    PrincipalId          = $schedule.PrincipalId
+                    AccountEnabled       = $principal.AccountEnabled
+                    AssignmentScope      = $roleEntry.AssignmentScope
+                    StartDateTime        = $schedule.StartDateTime
+                    EndDateTime          = if ($schedule.EndDateTime) { $schedule.EndDateTime } else { "No Expiry" }
+                    GroupName            = $groupDisplayName
+                    GroupId              = $groupId
+                    MembershipType       = $schedule.AccessId   # "member" or "owner"
+                })
+            }
+        }
+    }
+    catch {
+        Write-Warning "Error processing PIM for Groups on group '$groupDisplayName' ($groupId): $_"
+    }
+}
+
+$pfgCount = ($report | Where-Object { $_.AssignmentSource -like "PIM for Groups*" } | Measure-Object).Count
+Write-Host "[+] PIM for Groups assignments collected: $pfgCount" -ForegroundColor Green
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# OUTPUT
+# ════════════════════════════════════════════════════════════════════════════════
+Write-Host "`n[*] Exporting report..." -ForegroundColor Cyan
+
+$report |
+    Sort-Object RoleName, AssignmentSource, PrincipalDisplayName |
+    Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`n╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host   "║       PRIVILEGED ROLE REPORT SUMMARY             ║" -ForegroundColor Green
+Write-Host   "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "  Total assignments found : $($report.Count)"
+Write-Host "  Direct Active           : $(($report | Where-Object AssignmentSource -eq 'Direct Active').Count)"
+Write-Host "  PIM Eligible            : $(($report | Where-Object AssignmentSource -eq 'PIM Eligible').Count)"
+Write-Host "  PIM Active (Activated)  : $(($report | Where-Object AssignmentSource -eq 'PIM Active (Activated)').Count)"
+Write-Host "  PIM for Groups Eligible : $(($report | Where-Object AssignmentSource -eq 'PIM for Groups (Eligible)').Count)"
+Write-Host "  PIM for Groups Active   : $(($report | Where-Object AssignmentSource -eq 'PIM for Groups (Active)').Count)"
+Write-Host ""
+Write-Host "  Output file: $OutputPath" -ForegroundColor Cyan
+Write-Host ""
+
+Disconnect-MgGraph | Out-Null
+Write-Host "[*] Disconnected from Microsoft Graph.`n" -ForegroundColor Gray
